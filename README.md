@@ -72,6 +72,4 @@ APK 위치: `client/android/app/build/outputs/apk/debug/app-debug.apk`
 
 ## 🧹 참고
 
-- 초기 버전(v0)은 Node.js + Express + PostgreSQL 풀스택으로 작성되었으나, v1에서 휴대폰 로컬 저장 방식으로 전환했습니다.
-- `server/`와 `docker-compose.yml`은 더 이상 사용하지 않는 레거시입니다.
-- 초기 프로토타입 원본: [운동관리.html](운동관리.html), [운동관리앱.jsx](운동관리앱.jsx)
+초기 버전(v0)은 Node.js + Express + PostgreSQL 풀스택으로 작성되었으나, v1에서 휴대폰 로컬 저장 방식으로 전환했습니다.
