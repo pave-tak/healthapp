@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#667eea">
+<title>운동 관리</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#f8fafc; color:#1e293b; overscroll-behavior:none; }
+input[type=number] { -moz-appearance:textfield; }
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
+button { font-family:inherit; }
+.loading-screen { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; color:#64748b; }
+.loading-screen .spinner { width:40px; height:40px; border:3px solid #e2e8f0; border-top-color:#667eea; border-radius:50%; animation:spin 0.8s linear infinite; margin-bottom:16px; }
+@keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"><div class="loading-screen"><div class="spinner"></div><div>로딩 중...</div></div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dexie/3.2.7/dexie.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dexie/3.2.7/dexie.js" onerror="console.warn('Dexie 보조 로드 실패 (정상)')"></script>
+<script>
+// Dexie 로드 실패 시 대체 CDN 시도
+if (typeof Dexie === 'undefined') {
+  document.write('<script src="https://cdn.jsdelivr.net/npm/dexie@3.2.7/dist/dexie.min.js"><\/script>');
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ═══════════════════════════════════════════
+// IndexedDB (Dexie.js) 데이터베이스 설정
+// Dexie 로드 실패 시 localStorage 폴백
+// ═══════════════════════════════════════════
+const USE_DEXIE = typeof Dexie !== 'undefined';
+let db = null;
+if (USE_DEXIE) {
+  try {
+    db = new Dexie("WorkoutDB");
+    db.version(1).stores({
+      workouts: "++id, date, exerciseName, category",
+      exerciseSettings: "++id, [category+name], category, name",
+    });
+    console.log("✅ IndexedDB(Dexie) 초기화 성공");
+  } catch (err) {
+    console.error("Dexie 초기화 실패, localStorage 사용:", err);
+  }
+} else {
+  console.warn("⚠️ Dexie 로드 실패 - localStorage로 폴백");
+}
+
+// ─── localStorage 폴백 헬퍼 ───
+const LS_KEYS = { log: "wk_log_v2", ex: "wk_exercises_v2" };
+const lsGet = (k, fallback) => { try { const d = localStorage.getItem(k); return d ? JSON.parse(d) : fallback; } catch { return fallback; } };
+const lsSet = (k, data) => { try { localStorage.setItem(k, JSON.stringify(data)); } catch (e) { console.error(e); } };
+
+// ─── DB 헬퍼 함수 (Dexie + localStorage 폴백) ───
+const DB = {
+  mode: USE_DEXIE && db ? "indexeddb" : "localstorage",
+
+  async saveDay(date, dayLog) {
+    if (this.mode === "indexeddb") {
+      await db.transaction("rw", db.workouts, async () => {
+        await db.workouts.where("date").equals(date).delete();
+        for (const ex of dayLog) {
+          await db.workouts.add({
+            date, exerciseName: ex.name, category: ex.category,
+            localId: ex.id, sets: JSON.stringify(ex.sets),
+          });
+        }
+      });
+    } else {
+      const all = lsGet(LS_KEYS.log, {});
+      if (dayLog.length === 0) delete all[date]; else all[date] = dayLog;
+      lsSet(LS_KEYS.log, all);
+    }
+  },
+
+  async getAllLogs() {
+    if (this.mode === "indexeddb") {
+      const rows = await db.workouts.toArray();
+      const logs = {};
+      for (const r of rows) {
+        if (!logs[r.date]) logs[r.date] = [];
+        logs[r.date].push({
+          id: r.localId || String(r.id),
+          name: r.exerciseName, category: r.category,
+          sets: JSON.parse(r.sets),
+        });
+      }
+      return logs;
+    } else {
+      return lsGet(LS_KEYS.log, {});
+    }
+  },
+
+  async saveExercises(exercises) {
+    if (this.mode === "indexeddb") {
+      await db.transaction("rw", db.exerciseSettings, async () => {
+        await db.exerciseSettings.clear();
+        for (const [category, list] of Object.entries(exercises)) {
+          for (const ex of list) {
+            await db.exerciseSettings.add({
+              category, name: ex.name, icon: ex.icon,
+              defaultReps: ex.defaultReps || 10,
+              defaultRestSec: ex.defaultRestSec || 60,
+            });
+          }
+        }
+      });
+    } else {
+      lsSet(LS_KEYS.ex, exercises);
+    }
+  },
+
+  async loadExercises() {
+    if (this.mode === "indexeddb") {
+      const rows = await db.exerciseSettings.toArray();
+      if (rows.length === 0) return null;
+      const result = {};
+      for (const r of rows) {
+        if (!result[r.category]) result[r.category] = [];
+        result[r.category].push({
+          name: r.name, icon: r.icon,
+          defaultReps: r.defaultReps, defaultRestSec: r.defaultRestSec,
+        });
+      }
+      return result;
+    } else {
+      return lsGet(LS_KEYS.ex, null);
+    }
+  },
+
+  async exportAll() {
+    if (this.mode === "indexeddb") {
+      const workouts = await db.workouts.toArray();
+      const settings = await db.exerciseSettings.toArray();
+      return { mode: "indexeddb", workouts, settings, exportDate: new Date().toISOString() };
+    } else {
+      return { mode: "localstorage", log: lsGet(LS_KEYS.log, {}), exercises: lsGet(LS_KEYS.ex, null), exportDate: new Date().toISOString() };
+    }
+  },
+
+  async importAll(data) {
+    if (this.mode === "indexeddb") {
+      await db.transaction("rw", db.workouts, db.exerciseSettings, async () => {
+        await db.workouts.clear();
+        await db.exerciseSettings.clear();
+        if (data.workouts) for (const w of data.workouts) { delete w.id; await db.workouts.add(w); }
+        if (data.settings) for (const s of data.settings) { delete s.id; await db.exerciseSettings.add(s); }
+        // localStorage로 백업된 데이터를 indexeddb로 복원하는 경우
+        if (data.log) {
+          for (const [date, dayLog] of Object.entries(data.log)) {
+            for (const ex of dayLog) {
+              await db.workouts.add({
+                date, exerciseName: ex.name, category: ex.category,
+                localId: ex.id, sets: JSON.stringify(ex.sets),
+              });
+            }
+          }
+        }
+        if (data.exercises) {
+          for (const [category, list] of Object.entries(data.exercises)) {
+            for (const ex of list) {
+              await db.exerciseSettings.add({
+                category, name: ex.name, icon: ex.icon,
+                defaultReps: ex.defaultReps || 10,
+                defaultRestSec: ex.defaultRestSec || 60,
+              });
+            }
+          }
+        }
+      });
+    } else {
+      if (data.log) lsSet(LS_KEYS.log, data.log);
+      if (data.exercises) lsSet(LS_KEYS.ex, data.exercises);
+      // indexeddb 형식을 localstorage 형식으로 변환
+      if (data.workouts) {
+        const logs = {};
+        for (const r of data.workouts) {
+          if (!logs[r.date]) logs[r.date] = [];
+          logs[r.date].push({ id: r.localId, name: r.exerciseName, category: r.category, sets: typeof r.sets === "string" ? JSON.parse(r.sets) : r.sets });
+        }
+        lsSet(LS_KEYS.log, logs);
+      }
+      if (data.settings) {
+        const ex = {};
+        for (const r of data.settings) {
+          if (!ex[r.category]) ex[r.category] = [];
+          ex[r.category].push({ name: r.name, icon: r.icon, defaultReps: r.defaultReps, defaultRestSec: r.defaultRestSec });
+        }
+        lsSet(LS_KEYS.ex, ex);
+      }
+    }
+  },
+
+  async clearAll() {
+    if (this.mode === "indexeddb") {
+      await db.workouts.clear();
+    } else {
+      lsSet(LS_KEYS.log, {});
+    }
+  },
+};
+
+// ═══════════════════════════════════════════
+// 아이콘 컴포넌트 (SVG)
+// ═══════════════════════════════════════════
+const Icon = ({name, size=22, color="currentColor"}) => {
+  const icons = {
+    home: <><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></>,
+    calendar: <><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>,
+    trending: <><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></>,
+    settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></>,
+    plus: <><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></>,
+    check: <polyline points="20 6 9 17 4 12"/>,
+    x: <><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>,
+    trash: <><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></>,
+    chevronL: <polyline points="15 18 9 12 15 6"/>,
+    chevronR: <polyline points="9 18 15 12 9 6"/>,
+    dumbbell: <><path d="M6.5 6.5h11"/><path d="M6.5 17.5h11"/><path d="M6 6.5a1 1 0 01-1-1V4a1 1 0 00-1-1H3a1 1 0 00-1 1v3.5a1 1 0 001 1"/><path d="M6 17.5a1 1 0 00-1 1V20a1 1 0 01-1 1H3a1 1 0 01-1-1v-3.5a1 1 0 011-1"/><path d="M18 6.5a1 1 0 001-1V4a1 1 0 011-1h1a1 1 0 011 1v3.5a1 1 0 01-1 1"/><path d="M18 17.5a1 1 0 011 1V20a1 1 0 001 1h1a1 1 0 001-1v-3.5a1 1 0 00-1-1"/></>,
+    clock: <><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></>,
+    listPlus: <><path d="M11 12H3"/><path d="M16 6H3"/><path d="M16 18H3"/><path d="M18 9v6"/><path d="M21 12h-6"/></>,
+    history: <><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 8 14"/></>,
+    db: <><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></>,
+  };
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      {icons[name]}
+    </svg>
+  );
+};
+
+// ═══════════════════════════════════════════
+// 기본 운동 데이터
+// ═══════════════════════════════════════════
+const DEFAULT_EXERCISES = {
+  "상체": [
+    { name: "턱걸이", icon: "💪", defaultReps: 5, defaultRestSec: 90 },
+    { name: "푸시업", icon: "🫸", defaultReps: 10, defaultRestSec: 60 },
+    { name: "딥스", icon: "🏋️", defaultReps: 8, defaultRestSec: 60 },
+  ],
+  "하체": [
+    { name: "스쿼트", icon: "🦵", defaultReps: 15, defaultRestSec: 60 },
+    { name: "뒷꿈치들기", icon: "🦶", defaultReps: 20, defaultRestSec: 45 },
+  ],
+  "유산소": [
+    { name: "달리기", icon: "🏃", defaultReps: 1, defaultRestSec: 0 },
+  ],
+};
+
+// ═══════════════════════════════════════════
+// 유틸리티
+// ═══════════════════════════════════════════
+const formatDate = (date) => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth()+1).padStart(2,"0");
+  const d = String(date.getDate()).padStart(2,"0");
+  return `${y}-${m}-${d}`;
+};
+const formatDateKor = (dateStr) => {
+  const d = new Date(dateStr + "T00:00:00");
+  const days = ["일","월","화","수","목","금","토"];
+  return `${d.getMonth()+1}월 ${d.getDate()}일 (${days[d.getDay()]})`;
+};
+const genId = () => Math.random().toString(36).substr(2,9);
+
+// ═══════════════════════════════════════════
+// 메인 앱
+// ═══════════════════════════════════════════
+function App() {
+  const [loading, setLoading] = useState(true);
+  const [tab, setTab] = useState("home");
+  const [selectedDate, setSelectedDate] = useState(formatDate(new Date()));
+  const [exercises, setExercises] = useState(DEFAULT_EXERCISES);
+  const [workoutLog, setWorkoutLog] = useState({});
+  const [showPicker, setShowPicker] = useState(false);
+  const [showAddCustom, setShowAddCustom] = useState(false);
+  const [customName, setCustomName] = useState("");
+  const [customCategory, setCustomCategory] = useState("상체");
+  const [restTimer, setRestTimer] = useState(null);
+  const [restSeconds, setRestSeconds] = useState(0);
+  const [dbStatus, setDbStatus] = useState("");
+  const timerRef = useRef(null);
+  const saveTimerRef = useRef(null);
+
+  // DB에서 초기 데이터 로드
+  useEffect(() => {
+    (async () => {
+      try {
+        // 운동 설정 로드
+        const savedExercises = await DB.loadExercises();
+        if (savedExercises && Object.keys(savedExercises).length > 0) {
+          setExercises(savedExercises);
+        } else {
+          // 첫 실행: 기본 운동 설정 DB에 저장
+          await DB.saveExercises(DEFAULT_EXERCISES);
+        }
+
+        // 전체 운동 기록 로드
+        const allLogs = await DB.getAllLogs();
+        setWorkoutLog(allLogs);
+
+        setDbStatus("connected");
+      } catch (err) {
+        console.error("DB 로드 실패:", err);
+        setDbStatus("error");
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  // workoutLog 변경 시 DB 저장 (디바운스 300ms)
+  const savingRef = useRef(false);
+  useEffect(() => {
+    if (loading) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      try {
+        // 변경된 날짜의 데이터만 저장
+        for (const [date, dayLog] of Object.entries(workoutLog)) {
+          await DB.saveDay(date, dayLog);
+        }
+      } catch (err) {
+        console.error("DB 저장 실패:", err);
+      }
+    }, 300);
+  }, [workoutLog, loading]);
+
+  // exercises 변경 시 DB 저장
+  useEffect(() => {
+    if (loading) return;
+    DB.saveExercises(exercises).catch(err => console.error("운동 설정 저장 실패:", err));
+  }, [exercises, loading]);
+
+  // 휴식 타이머
+  useEffect(() => {
+    if (restTimer !== null && restTimer > 0) {
+      timerRef.current = setInterval(() => {
+        setRestTimer(prev => {
+          if (prev <= 1) { clearInterval(timerRef.current); return 0; }
+          return prev - 1;
+        });
+      }, 1000);
+      return () => clearInterval(timerRef.current);
+    }
+  }, [restTimer]);
+
+  const todayLog = workoutLog[selectedDate] || [];
+
+  const getDefaults = (name) => {
+    for (const cat of Object.values(exercises)) {
+      const f = cat.find(e => e.name === name);
+      if (f) return { reps: f.defaultReps || 10, restSec: f.defaultRestSec || 60 };
+    }
+    return { reps: 10, restSec: 60 };
+  };
+
+  const addExercise = (name, category) => {
+    const def = getDefaults(name);
+    setWorkoutLog(prev => ({
+      ...prev,
+      [selectedDate]: [...(prev[selectedDate]||[]), { id: genId(), name, category, sets: [{ reps: def.reps, restSec: def.restSec, done: false }] }],
+    }));
+    setShowPicker(false);
+  };
+
+  const removeExercise = (id) => {
+    setWorkoutLog(prev => ({ ...prev, [selectedDate]: (prev[selectedDate]||[]).filter(e => e.id !== id) }));
+  };
+
+  const addSet = (exerciseId) => {
+    setWorkoutLog(prev => {
+      const u = { ...prev }; const dl = [...(u[selectedDate]||[])];
+      const i = dl.findIndex(e => e.id === exerciseId);
+      if (i >= 0) {
+        const ls = dl[i].sets[dl[i].sets.length-1];
+        dl[i] = { ...dl[i], sets: [...dl[i].sets, { reps: ls?.reps||10, restSec: ls?.restSec||60, done: false }] };
+      }
+      u[selectedDate] = dl; return u;
+    });
+  };
+
+  const removeSet = (exerciseId, si) => {
+    setWorkoutLog(prev => {
+      const u = { ...prev }; const dl = [...(u[selectedDate]||[])];
+      const i = dl.findIndex(e => e.id === exerciseId);
+      if (i >= 0 && dl[i].sets.length > 1) dl[i] = { ...dl[i], sets: dl[i].sets.filter((_,j) => j !== si) };
+      u[selectedDate] = dl; return u;
+    });
+  };
+
+  const updateSet = (exerciseId, si, field, value) => {
+    setWorkoutLog(prev => {
+      const u = { ...prev }; const dl = [...(u[selectedDate]||[])];
+      const i = dl.findIndex(e => e.id === exerciseId);
+      if (i >= 0) { const ns = [...dl[i].sets]; ns[si] = { ...ns[si], [field]: value }; dl[i] = { ...dl[i], sets: ns }; }
+      u[selectedDate] = dl; return u;
+    });
+  };
+
+  const toggleDone = (exerciseId, si) => {
+    setWorkoutLog(prev => {
+      const u = { ...prev }; const dl = [...(u[selectedDate]||[])];
+      const i = dl.findIndex(e => e.id === exerciseId);
+      if (i >= 0) {
+        const ns = [...dl[i].sets]; const was = ns[si].done;
+        ns[si] = { ...ns[si], done: !was }; dl[i] = { ...dl[i], sets: ns };
+        if (!was && ns[si].restSec > 0) { setRestTimer(ns[si].restSec); setRestSeconds(ns[si].restSec); }
+      }
+      u[selectedDate] = dl; return u;
+    });
+  };
+
+  const addCustom = () => {
+    if (!customName.trim()) return;
+    setExercises(prev => ({
+      ...prev,
+      [customCategory]: [...(prev[customCategory]||[]), { name: customName.trim(), icon: "🏃", defaultReps: 10, defaultRestSec: 60 }],
+    }));
+    setCustomName(""); setShowAddCustom(false);
+  };
+
+  const moveDate = (days) => { const d = new Date(selectedDate + "T00:00:00"); d.setDate(d.getDate()+days); setSelectedDate(formatDate(d)); };
+
+  const getProgress = () => {
+    if (!todayLog.length) return 0;
+    let t=0, d=0;
+    todayLog.forEach(ex => ex.sets.forEach(s => { t++; if(s.done) d++; }));
+    return t > 0 ? Math.round((d/t)*100) : 0;
+  };
+
+  const getStats = () => {
+    const dates = Object.keys(workoutLog).filter(d => workoutLog[d].length > 0).sort();
+    let totalSets=0, totalReps=0; const ec = {};
+    dates.forEach(date => {
+      workoutLog[date].forEach(ex => {
+        ec[ex.name] = (ec[ex.name]||0) + 1;
+        ex.sets.forEach(s => { if(s.done) { totalSets++; totalReps += s.reps; } });
+      });
+    });
+    return { totalDays: dates.length, totalSets, totalReps, top: Object.entries(ec).sort((a,b) => b[1]-a[1]).slice(0,5) };
+  };
+
+  // ─── 스타일 상수 ───
+  const S = {
+    navBtn: { background:"#f1f5f9", border:"none", borderRadius:10, width:40, height:40, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", color:"#475569" },
+    input: { width:"100%", padding:"8px 10px", borderRadius:10, border:"1px solid #e2e8f0", fontSize:15, textAlign:"center", outline:"none", fontVariantNumeric:"tabular-nums", background:"#f8fafc" },
+    stepBtn: { width:36, height:36, borderRadius:10, border:"1px solid #e2e8f0", background:"#f8fafc", fontSize:18, fontWeight:700, color:"#475569", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" },
+    settInput: { width:"100%", padding:"8px 6px", borderRadius:10, border:"1px solid #e2e8f0", fontSize:16, textAlign:"center", outline:"none", fontVariantNumeric:"tabular-nums", background:"white" },
+  };
+
+  // ─── 휴식 타이머 오버레이 ───
+  const RestOverlay = () => {
+    if (restTimer === null || restTimer <= 0) return null;
+    const pct = ((restSeconds - restTimer) / restSeconds) * 100;
+    return (
+      <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.85)", zIndex:100, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"white" }}>
+        <Icon name="clock" size={48} color="rgba(255,255,255,0.7)" />
+        <div style={{ fontSize:18, opacity:0.8, margin:"16px 0 8px" }}>휴식 시간</div>
+        <div style={{ fontSize:72, fontWeight:700, fontVariantNumeric:"tabular-nums" }}>
+          {Math.floor(restTimer/60)}:{String(restTimer%60).padStart(2,"0")}
+        </div>
+        <div style={{ width:200, height:6, background:"rgba(255,255,255,0.2)", borderRadius:3, marginTop:24, overflow:"hidden" }}>
+          <div style={{ width:`${pct}%`, height:"100%", background:"linear-gradient(90deg,#4ade80,#22c55e)", borderRadius:3, transition:"width 1s linear" }}/>
+        </div>
+        <button onClick={() => { setRestTimer(null); clearInterval(timerRef.current); }} style={{ marginTop:32, padding:"12px 32px", borderRadius:12, background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.3)", color:"white", fontSize:16, cursor:"pointer" }}>
+          건너뛰기
+        </button>
+      </div>
+    );
+  };
+
+  // ─── 홈 탭 ───
+  const HomeTab = () => {
+    const progress = getProgress();
+    const isToday = selectedDate === formatDate(new Date());
+    return (
+      <div style={{ padding:"0 16px 100px" }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"16px 0", marginBottom:8 }}>
+          <button onClick={() => moveDate(-1)} style={S.navBtn}><Icon name="chevronL" size={20}/></button>
+          <div style={{ textAlign:"center" }}>
+            <div style={{ fontSize:18, fontWeight:700 }}>{formatDateKor(selectedDate)}</div>
+            {isToday && <div style={{ fontSize:12, color:"#22c55e", fontWeight:600 }}>오늘</div>}
+          </div>
+          <button onClick={() => moveDate(1)} style={S.navBtn}><Icon name="chevronR" size={20}/></button>
+        </div>
+
+        {todayLog.length > 0 && (
+          <div style={{ background:"linear-gradient(135deg,#667eea 0%,#764ba2 100%)", borderRadius:16, padding:20, marginBottom:16, color:"white" }}>
+            <div style={{ fontSize:14, opacity:0.9, marginBottom:4 }}>오늘의 진행률</div>
+            <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+              <div style={{ fontSize:36, fontWeight:800 }}>{progress}%</div>
+              <div style={{ flex:1, height:8, background:"rgba(255,255,255,0.3)", borderRadius:4, overflow:"hidden" }}>
+                <div style={{ width:`${progress}%`, height:"100%", background:"white", borderRadius:4, transition:"width 0.3s ease" }}/>
+              </div>
+            </div>
+            <div style={{ fontSize:13, opacity:0.8, marginTop:6 }}>{todayLog.length}개 운동 · {todayLog.reduce((a,e) => a+e.sets.length, 0)}세트</div>
+          </div>
+        )}
+
+        {todayLog.length === 0 ? (
+          <div style={{ textAlign:"center", padding:"60px 20px", color:"#94a3b8" }}>
+            <div style={{ marginBottom:16, opacity:0.4 }}><Icon name="dumbbell" size={48} color="#94a3b8"/></div>
+            <div style={{ fontSize:16, fontWeight:600, marginBottom:8 }}>아직 운동이 없습니다</div>
+            <div style={{ fontSize:14 }}>아래 버튼으로 운동을 추가해보세요</div>
+          </div>
+        ) : (
+          todayLog.map(exercise => (
+            <div key={exercise.id} style={{ background:"white", borderRadius:16, marginBottom:12, boxShadow:"0 1px 3px rgba(0,0,0,0.08)", overflow:"hidden" }}>
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 16px", borderBottom:"1px solid #f1f5f9" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <span style={{ fontSize:13, color:"#64748b", background:"#f1f5f9", borderRadius:8, padding:"2px 8px" }}>{exercise.category}</span>
+                  <span style={{ fontSize:16, fontWeight:700 }}>{exercise.name}</span>
+                </div>
+                <button onClick={() => removeExercise(exercise.id)} style={{ background:"none", border:"none", color:"#ef4444", cursor:"pointer", padding:4 }}>
+                  <Icon name="trash" size={18} color="#ef4444"/>
+                </button>
+              </div>
+
+              <div style={{ display:"grid", gridTemplateColumns:"40px 1fr 1fr 50px 36px", padding:"8px 16px", fontSize:12, color:"#94a3b8", fontWeight:600, gap:8, alignItems:"center" }}>
+                <div>세트</div><div>횟수</div><div>휴식(초)</div><div style={{ textAlign:"center" }}>완료</div><div></div>
+              </div>
+
+              {exercise.sets.map((set, si) => (
+                <div key={si} style={{ display:"grid", gridTemplateColumns:"40px 1fr 1fr 50px 36px", padding:"6px 16px", gap:8, alignItems:"center", background:set.done?"#f0fdf4":"transparent", transition:"background 0.2s" }}>
+                  <div style={{ width:28, height:28, borderRadius:"50%", background:set.done?"#22c55e":"#e2e8f0", color:set.done?"white":"#64748b", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, fontWeight:700 }}>{si+1}</div>
+                  <input type="number" value={set.reps} onChange={e => updateSet(exercise.id, si, "reps", Math.max(0, parseInt(e.target.value)||0))} style={S.input}/>
+                  <input type="number" value={set.restSec} onChange={e => updateSet(exercise.id, si, "restSec", Math.max(0, parseInt(e.target.value)||0))} style={S.input}/>
+                  <div style={{ textAlign:"center" }}>
+                    <button onClick={() => toggleDone(exercise.id, si)} style={{ width:36, height:36, borderRadius:10, border:"none", background:set.done?"#22c55e":"#e2e8f0", color:set.done?"white":"#94a3b8", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      <Icon name="check" size={18} color={set.done?"white":"#94a3b8"}/>
+                    </button>
+                  </div>
+                  <button onClick={() => removeSet(exercise.id, si)} style={{ background:"none", border:"none", color:"#cbd5e1", cursor:"pointer", padding:4 }}>
+                    <Icon name="x" size={16} color="#cbd5e1"/>
+                  </button>
+                </div>
+              ))}
+
+              <button onClick={() => addSet(exercise.id)} style={{ width:"100%", padding:10, border:"none", background:"#f8fafc", color:"#64748b", fontSize:14, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:6 }}>
+                <Icon name="plus" size={16} color="#64748b"/> 세트 추가
+              </button>
+            </div>
+          ))
+        )}
+
+        <button onClick={() => setShowPicker(true)} style={{ width:"100%", padding:16, borderRadius:16, border:"2px dashed #cbd5e1", background:"white", color:"#64748b", fontSize:16, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8, marginTop:8 }}>
+          <Icon name="plus" size={20} color="#64748b"/> 운동 추가
+        </button>
+      </div>
+    );
+  };
+
+  // ─── 기록 탭 ───
+  const HistoryTab = () => {
+    const dates = Object.keys(workoutLog).filter(d => workoutLog[d].length > 0).sort().reverse();
+    return (
+      <div style={{ padding:"16px 16px 100px" }}>
+        <h2 style={{ fontSize:20, fontWeight:800, marginBottom:16 }}>운동 기록</h2>
+        {dates.length === 0 ? (
+          <div style={{ textAlign:"center", padding:"60px 20px", color:"#94a3b8" }}>
+            <div style={{ marginBottom:16, opacity:0.4 }}><Icon name="history" size={48} color="#94a3b8"/></div>
+            <div style={{ fontSize:16 }}>아직 기록이 없습니다</div>
+          </div>
+        ) : dates.map(date => {
+          const log = workoutLog[date]; const ts = log.reduce((a,e) => a+e.sets.length, 0); const ds = log.reduce((a,e) => a+e.sets.filter(s=>s.done).length, 0);
+          return (
+            <div key={date} onClick={() => { setSelectedDate(date); setTab("home"); }} style={{ background:"white", borderRadius:14, padding:16, marginBottom:10, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", cursor:"pointer" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+                <div style={{ fontWeight:700, fontSize:16 }}>{formatDateKor(date)}</div>
+                <div style={{ fontSize:13, fontWeight:600, color:ds===ts&&ts>0?"#22c55e":"#f59e0b" }}>{ds}/{ts} 세트</div>
+              </div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                {log.map(ex => <span key={ex.id} style={{ background:"#f1f5f9", borderRadius:8, padding:"4px 10px", fontSize:13, color:"#475569" }}>{ex.name} ({ex.sets.length}세트)</span>)}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // ─── 통계 탭 ───
+  const StatsTab = () => {
+    const stats = getStats();
+    const last7 = [];
+    for (let i=6; i>=0; i--) { const d=new Date(); d.setDate(d.getDate()-i); const ds=formatDate(d);
+      last7.push({ date:ds, day:["일","월","화","수","목","금","토"][d.getDay()], has:!!workoutLog[ds]&&workoutLog[ds].length>0, sets: workoutLog[ds]?.reduce((a,e) => a+e.sets.filter(s=>s.done).length, 0)||0 });
+    }
+    const mx = Math.max(...last7.map(d=>d.sets), 1);
+    return (
+      <div style={{ padding:"16px 16px 100px" }}>
+        <h2 style={{ fontSize:20, fontWeight:800, marginBottom:16 }}>통계</h2>
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:20 }}>
+          {[{l:"운동 일수",v:stats.totalDays,c:"#667eea"},{l:"총 세트",v:stats.totalSets,c:"#22c55e"},{l:"총 횟수",v:stats.totalReps,c:"#f59e0b"}].map(s => (
+            <div key={s.l} style={{ background:"white", borderRadius:14, padding:16, textAlign:"center", boxShadow:"0 1px 3px rgba(0,0,0,0.06)" }}>
+              <div style={{ fontSize:24, fontWeight:800, color:s.c }}>{s.v}</div>
+              <div style={{ fontSize:12, color:"#94a3b8", marginTop:4 }}>{s.l}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{ background:"white", borderRadius:14, padding:16, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", marginBottom:20 }}>
+          <div style={{ fontSize:15, fontWeight:700, marginBottom:16 }}>최근 7일</div>
+          <div style={{ display:"flex", alignItems:"flex-end", justifyContent:"space-between", height:120, gap:8 }}>
+            {last7.map(d => (
+              <div key={d.date} style={{ flex:1, textAlign:"center" }}>
+                <div style={{ height:d.sets>0?Math.max(20,(d.sets/mx)*90):4, background:d.has?"linear-gradient(180deg,#667eea,#764ba2)":"#e2e8f0", borderRadius:6, marginBottom:6, transition:"height 0.3s ease" }}/>
+                <div style={{ fontSize:11, fontWeight:600, color:d.date===formatDate(new Date())?"#667eea":"#94a3b8" }}>{d.day}</div>
+                {d.sets>0 && <div style={{ fontSize:10, color:"#64748b" }}>{d.sets}</div>}
+              </div>
+            ))}
+          </div>
+        </div>
+        {stats.top.length > 0 && (
+          <div style={{ background:"white", borderRadius:14, padding:16, boxShadow:"0 1px 3px rgba(0,0,0,0.06)" }}>
+            <div style={{ fontSize:15, fontWeight:700, marginBottom:12 }}>자주 하는 운동</div>
+            {stats.top.map(([name,count],i) => (
+              <div key={name} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:i<stats.top.length-1?"1px solid #f1f5f9":"none" }}>
+                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                  <div style={{ width:28, height:28, borderRadius:"50%", background:["#667eea","#22c55e","#f59e0b","#ef4444","#8b5cf6"][i], color:"white", fontSize:13, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center" }}>{i+1}</div>
+                  <span style={{ fontSize:15, fontWeight:600, color:"#334155" }}>{name}</span>
+                </div>
+                <span style={{ fontSize:14, color:"#94a3b8" }}>{count}회</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ─── 설정 탭 ───
+  const SettingsTab = () => {
+    const updateDefault = (cat, ei, field, val) => {
+      setExercises(prev => {
+        const u = { ...prev }; const cl = [...u[cat]];
+        cl[ei] = { ...cl[ei], [field]: Math.max(field==="defaultRestSec"?0:1, parseInt(val)||0) };
+        u[cat] = cl; return u;
+      });
+    };
+    return (
+      <div style={{ padding:"16px 16px 100px" }}>
+        <h2 style={{ fontSize:20, fontWeight:800, marginBottom:6 }}>설정</h2>
+        <p style={{ fontSize:14, color:"#94a3b8", marginBottom:20 }}>운동별 기본 횟수와 휴식시간을 설정합니다.</p>
+
+        {/* DB 상태 표시 */}
+        <div style={{ background:"white", borderRadius:14, padding:14, marginBottom:20, boxShadow:"0 1px 3px rgba(0,0,0,0.06)", display:"flex", alignItems:"center", gap:10 }}>
+          <Icon name="db" size={20} color={dbStatus==="connected"?"#22c55e":"#ef4444"}/>
+          <div>
+            <div style={{ fontSize:14, fontWeight:600 }}>
+              {DB.mode === "indexeddb" ? "IndexedDB" : "LocalStorage"} 저장소
+            </div>
+            <div style={{ fontSize:12, color:dbStatus==="connected"?"#22c55e":"#ef4444" }}>
+              {dbStatus==="connected" ? "정상 연결됨 · 데이터 자동 저장" : "연결 오류"}
+              {DB.mode === "localstorage" && " (IndexedDB 사용 불가 - localStorage 사용 중)"}
+            </div>
+          </div>
+        </div>
+
+        {Object.entries(exercises).map(([cat, list]) => (
+          <div key={cat} style={{ marginBottom:20 }}>
+            <div style={{ fontSize:14, fontWeight:700, color:"#64748b", marginBottom:10, paddingLeft:4 }}>{cat}</div>
+            {list.map((ex,ei) => (
+              <div key={ex.name} style={{ background:"white", borderRadius:14, padding:16, marginBottom:8, boxShadow:"0 1px 3px rgba(0,0,0,0.06)" }}>
+                <div style={{ fontSize:16, fontWeight:700, marginBottom:12 }}>{ex.icon} {ex.name}</div>
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+                  <div>
+                    <div style={{ fontSize:12, color:"#94a3b8", marginBottom:6, fontWeight:600 }}>기본 횟수</div>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <button onClick={() => updateDefault(cat,ei,"defaultReps",(ex.defaultReps||10)-1)} style={S.stepBtn}>−</button>
+                      <input type="number" value={ex.defaultReps||10} onChange={e => updateDefault(cat,ei,"defaultReps",e.target.value)} style={{ ...S.settInput, flex:1 }}/>
+                      <button onClick={() => updateDefault(cat,ei,"defaultReps",(ex.defaultReps||10)+1)} style={S.stepBtn}>+</button>
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize:12, color:"#94a3b8", marginBottom:6, fontWeight:600 }}>휴식(초)</div>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <button onClick={() => updateDefault(cat,ei,"defaultRestSec",(ex.defaultRestSec||60)-5)} style={S.stepBtn}>−</button>
+                      <input type="number" value={ex.defaultRestSec||60} onChange={e => updateDefault(cat,ei,"defaultRestSec",e.target.value)} style={{ ...S.settInput, flex:1 }}/>
+                      <button onClick={() => updateDefault(cat,ei,"defaultRestSec",(ex.defaultRestSec||60)+5)} style={S.stepBtn}>+</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {/* 데이터 관리 */}
+        <div style={{ marginTop:20, borderTop:"1px solid #e2e8f0", paddingTop:20 }}>
+          <div style={{ fontSize:14, fontWeight:700, color:"#64748b", marginBottom:10 }}>데이터 관리</div>
+          <button onClick={async () => {
+            try {
+              const data = await DB.exportAll();
+              const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a"); a.href = url; a.download = `운동기록_${formatDate(new Date())}.json`; a.click();
+              URL.revokeObjectURL(url);
+            } catch (err) { alert("백업 실패: " + err.message); }
+          }} style={{ width:"100%", padding:14, borderRadius:12, border:"1px solid #e2e8f0", background:"white", color:"#334155", fontSize:15, fontWeight:600, cursor:"pointer", marginBottom:8 }}>
+            📥 데이터 백업 (JSON 다운로드)
+          </button>
+          <label style={{ display:"block", width:"100%", padding:14, borderRadius:12, border:"1px solid #e2e8f0", background:"white", color:"#334155", fontSize:15, fontWeight:600, cursor:"pointer", textAlign:"center", marginBottom:8 }}>
+            📤 데이터 복원 (JSON 업로드)
+            <input type="file" accept=".json" style={{ display:"none" }} onChange={async e => {
+              const file = e.target.files[0]; if (!file) return;
+              const reader = new FileReader();
+              reader.onload = async ev => {
+                try {
+                  const d = JSON.parse(ev.target.result);
+                  await DB.importAll(d);
+                  // 다시 로드
+                  const savedEx = await DB.loadExercises();
+                  if (savedEx) setExercises(savedEx);
+                  const allLogs = await DB.getAllLogs();
+                  setWorkoutLog(allLogs);
+                  alert("데이터를 복원했습니다!");
+                } catch (err) { alert("복원 실패: " + err.message); }
+              };
+              reader.readAsText(file);
+            }}/>
+          </label>
+          <button onClick={async () => {
+            if (confirm("정말 모든 데이터를 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.")) {
+              try {
+                await DB.clearAll();
+                setWorkoutLog({});
+                alert("운동 기록이 모두 삭제되었습니다.");
+              } catch (err) { alert("삭제 실패: " + err.message); }
+            }
+          }} style={{ width:"100%", padding:14, borderRadius:12, border:"1px solid #fecaca", background:"#fff5f5", color:"#ef4444", fontSize:15, fontWeight:600, cursor:"pointer" }}>
+            🗑️ 운동 기록 전체 삭제
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── 운동 선택 모달 ───
+  const Picker = () => {
+    if (!showPicker) return null;
+    return (
+      <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.5)", zIndex:50, display:"flex", flexDirection:"column", justifyContent:"flex-end" }}>
+        <div style={{ background:"white", borderRadius:"20px 20px 0 0", maxHeight:"80vh", overflow:"auto", padding:"20px 16px" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+            <h3 style={{ fontSize:18, fontWeight:800 }}>운동 선택</h3>
+            <button onClick={() => { setShowPicker(false); setShowAddCustom(false); }} style={{ background:"#f1f5f9", border:"none", borderRadius:10, width:36, height:36, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <Icon name="x" size={18}/>
+            </button>
+          </div>
+          {Object.entries(exercises).map(([cat, list]) => (
+            <div key={cat} style={{ marginBottom:16 }}>
+              <div style={{ fontSize:14, fontWeight:700, color:"#64748b", marginBottom:8, paddingLeft:4 }}>{cat}</div>
+              <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                {list.map(ex => (
+                  <button key={ex.name} onClick={() => addExercise(ex.name, cat)} style={{ padding:"10px 16px", borderRadius:12, border:"1px solid #e2e8f0", background:"white", fontSize:14, cursor:"pointer", color:"#334155", fontWeight:500 }}>
+                    {ex.icon} {ex.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+          <div style={{ borderTop:"1px solid #f1f5f9", paddingTop:16, marginTop:8 }}>
+            {!showAddCustom ? (
+              <button onClick={() => setShowAddCustom(true)} style={{ width:"100%", padding:14, borderRadius:12, border:"2px dashed #cbd5e1", background:"transparent", color:"#64748b", fontSize:15, fontWeight:600, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", gap:8 }}>
+                <Icon name="listPlus" size={18} color="#64748b"/> 직접 추가
+              </button>
+            ) : (
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                <input type="text" value={customName} onChange={e => setCustomName(e.target.value)} placeholder="운동 이름 입력" style={{ padding:"12px 16px", borderRadius:12, border:"1px solid #e2e8f0", fontSize:15, outline:"none" }} autoFocus/>
+                <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                  {Object.keys(exercises).map(c => (
+                    <button key={c} onClick={() => setCustomCategory(c)} style={{ padding:"8px 16px", borderRadius:10, border:"none", background:customCategory===c?"#667eea":"#f1f5f9", color:customCategory===c?"white":"#64748b", fontSize:14, fontWeight:600, cursor:"pointer" }}>{c}</button>
+                  ))}
+                </div>
+                <div style={{ display:"flex", gap:8 }}>
+                  <button onClick={addCustom} style={{ flex:1, padding:12, borderRadius:12, border:"none", background:"#22c55e", color:"white", fontSize:15, fontWeight:600, cursor:"pointer" }}>추가</button>
+                  <button onClick={() => setShowAddCustom(false)} style={{ padding:"12px 20px", borderRadius:12, border:"none", background:"#f1f5f9", color:"#64748b", fontSize:15, cursor:"pointer" }}>취소</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── 로딩 화면 ───
+  if (loading) {
+    return (
+      <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", minHeight:"100vh", color:"#64748b" }}>
+        <div style={{ width:40, height:40, border:"3px solid #e2e8f0", borderTopColor:"#667eea", borderRadius:"50%", animation:"spin 0.8s linear infinite", marginBottom:16 }}/>
+        <div>데이터베이스 로딩 중...</div>
+      </div>
+    );
+  }
+
+  // ─── 메인 렌더 ───
+  const tabs = [
+    { id:"home", label:"오늘", icon:"home" },
+    { id:"history", label:"기록", icon:"calendar" },
+    { id:"stats", label:"통계", icon:"trending" },
+    { id:"settings", label:"설정", icon:"settings" },
+  ];
+
+  return (
+    <div style={{ maxWidth:480, margin:"0 auto", minHeight:"100vh", background:"#f8fafc", position:"relative" }}>
+      <div style={{ background:"white", padding:"16px 20px", borderBottom:"1px solid #f1f5f9", position:"sticky", top:0, zIndex:30 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ width:36, height:36, borderRadius:10, background:"linear-gradient(135deg,#667eea,#764ba2)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <Icon name="dumbbell" size={20} color="white"/>
+          </div>
+          <div>
+            <div style={{ fontSize:18, fontWeight:800 }}>운동 관리</div>
+            <div style={{ fontSize:12, color:"#94a3b8" }}>매일 조금씩, 꾸준하게</div>
+          </div>
+        </div>
+      </div>
+
+      {tab === "home" && <HomeTab/>}
+      {tab === "history" && <HistoryTab/>}
+      {tab === "stats" && <StatsTab/>}
+      {tab === "settings" && <SettingsTab/>}
+
+      <div style={{ position:"fixed", bottom:0, left:"50%", transform:"translateX(-50%)", width:"100%", maxWidth:480, background:"white", borderTop:"1px solid #f1f5f9", display:"flex", justifyContent:"space-around", padding:"8px 0 env(safe-area-inset-bottom, 20px)", zIndex:30 }}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{ background:"none", border:"none", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:4, padding:"4px 16px", color:tab===t.id?"#667eea":"#94a3b8", transition:"color 0.2s" }}>
+            <Icon name={t.icon} size={22} color={tab===t.id?"#667eea":"#94a3b8"}/>
+            <span style={{ fontSize:11, fontWeight:600 }}>{t.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <Picker/>
+      <RestOverlay/>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>

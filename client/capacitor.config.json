@@ -1,0 +1,12 @@
+{
+  "appId": "com.yt.workout",
+  "appName": "운동 관리",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#0a0e1aff"
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}
