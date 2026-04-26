@@ -8,7 +8,12 @@
     "preview": "vite preview",
     "sync:android":  "vite build && npx cap sync android",
     "open:android":  "npx cap open android",
-    "build:apk":     "vite build && npx cap sync android && cd android && gradlew.bat assembleDebug"
+    "build:apk":     "vite build && npx cap sync android && cd android && gradlew.bat assembleDebug",
+    "build:apk:release": "vite build && npx cap sync android && cd android && gradlew.bat assembleRelease",
+    "emulator":      "\"%LOCALAPPDATA%\\Android\\Sdk\\emulator\\emulator.exe\" -avd pixel_7_-_api_36",
+    "install:apk":   "\"%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe\" install -r android\\app\\build\\outputs\\apk\\debug\\app-debug.apk",
+    "launch:app":    "\"%LOCALAPPDATA%\\Android\\Sdk\\platform-tools\\adb.exe\" shell monkey -p com.yt.workout -c android.intent.category.LAUNCHER 1",
+    "run:android":   "npm run build:apk && npm run install:apk && npm run launch:app"
   },
   "dependencies": {
     "@capacitor/android": "^8.3.1",

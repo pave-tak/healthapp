@@ -20,6 +20,82 @@ const formatDateKor = (dateStr) => {
 };
 const genId = () => Math.random().toString(36).substr(2, 9);
 
+// 알람용 PCM WAV(beep) 를 base64 data URI 로 생성. WebAudio 가 막히는 환경에서
+// HTMLAudioElement 백업 채널로 사용한다.
+function makeBeepDataUri({ freq = 880, ms = 700, vol = 0.7, sampleRate = 22050 } = {}) {
+  const samples = Math.floor((ms / 1000) * sampleRate);
+  const buf = new ArrayBuffer(44 + samples * 2);
+  const dv  = new DataView(buf);
+  let p = 0;
+  const writeStr = (s) => { for (let i = 0; i < s.length; i++) dv.setUint8(p++, s.charCodeAt(i)); };
+  writeStr("RIFF"); dv.setUint32(p, 36 + samples * 2, true); p += 4;
+  writeStr("WAVEfmt "); dv.setUint32(p, 16, true); p += 4;
+  dv.setUint16(p, 1, true); p += 2;
+  dv.setUint16(p, 1, true); p += 2;
+  dv.setUint32(p, sampleRate, true); p += 4;
+  dv.setUint32(p, sampleRate * 2, true); p += 4;
+  dv.setUint16(p, 2, true); p += 2;
+  dv.setUint16(p, 16, true); p += 2;
+  writeStr("data"); dv.setUint32(p, samples * 2, true); p += 4;
+  const beepLen = Math.floor(sampleRate * 0.18);
+  const gapLen  = Math.floor(sampleRate * 0.08);
+  for (let i = 0; i < samples; i++) {
+    const cycle  = beepLen + gapLen;
+    const phase  = i % cycle;
+    let v = 0;
+    if (phase < beepLen) {
+      const env = Math.min(1, phase / 200, (beepLen - phase) / 800);
+      v = Math.sin(2 * Math.PI * freq * (i / sampleRate)) * vol * env;
+    }
+    dv.setInt16(p, Math.max(-1, Math.min(1, v)) * 32767, true); p += 2;
+  }
+  let bin = "";
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return "data:audio/wav;base64," + btoa(bin);
+}
+const ALARM_DATA_URI = makeBeepDataUri({ freq: 880, ms: 1100, vol: 0.7 });
+
+// 숫자 입력: 타이핑 중에는 외부 상태를 갱신하지 않고, 포커스가 빠질 때(blur) 한 번만
+// 반영한다. 빈 문자열로 끝나면 이전 값으로 되돌린다.
+function NumberField({ value, onChange, min = 0, style }) {
+  const [text, setText] = useState(String(value ?? ""));
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedRef.current) setText(String(value ?? ""));
+  }, [value]);
+
+  return (
+    <input
+      type="number"
+      inputMode="numeric"
+      enterKeyHint="done"
+      value={text}
+      onFocus={() => { focusedRef.current = true; }}
+      onChange={(e) => setText(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          e.currentTarget.blur(); // 키보드의 완료/엔터 → blur 강제 → commit
+        }
+      }}
+      onBlur={(e) => {
+        focusedRef.current = false;
+        const raw = e.target.value;
+        if (raw === "" || isNaN(parseInt(raw, 10))) {
+          setText(String(value ?? ""));
+          return;
+        }
+        const n = Math.max(min, parseInt(raw, 10));
+        setText(String(n));
+        if (n !== value) onChange(n);
+      }}
+      style={style}
+    />
+  );
+}
+
 // ─── 다크 테마 팔레트 ───
 const T = {
   surface:      "rgba(30,41,59,0.7)",      // 카드 배경 (반투명)
@@ -63,6 +139,9 @@ export default function App() {
   const [restTimer, setRestTimer]     = useState(null);
   const [restSeconds, setRestSeconds] = useState(0);
   const timerRef    = useRef(null);
+  const audioCtxRef = useRef(null);
+  const alarmAudioRef = useRef(null);
+  const audioUnlockedRef = useRef(false);
   const saveTimerRef = useRef(null);
   const savingRef   = useRef(false);
   const dateInputRef = useRef(null);
@@ -163,12 +242,84 @@ export default function App() {
     }, 500);
   }, [workoutLog, loading]);
 
+  // ─── 오디오(비프) / 진동 유틸 ───
+  // 첫 재생은 반드시 사용자 제스처 안에서 getAudioCtx() 를 한 번 호출해 context 를
+  // 깨워야 한다(모바일 자동재생 정책). toggleDone 에서 arming 한다.
+  const getAudioCtx = () => {
+    if (!audioCtxRef.current) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) audioCtxRef.current = new Ctx();
+    }
+    const c = audioCtxRef.current;
+    if (c && c.state === "suspended") c.resume();
+    return c;
+  };
+  const beep = (freq = 880, duration = 0.15, gain = 0.3) => {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    const osc = ctx.createOscillator();
+    const g   = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    osc.connect(g); g.connect(ctx.destination);
+    const t0 = ctx.currentTime;
+    g.gain.setValueAtTime(gain, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+    osc.start(t0);
+    osc.stop(t0 + duration);
+  };
+  const vibrate = (p) => { if (navigator.vibrate) navigator.vibrate(p); };
+
+  // 안드로이드 WebView 등에서 WebAudio 가 막히는 경우를 위한 백업: HTMLAudioElement 로
+  // WAV data URI 를 재생. 첫 사용자 제스처에서 unlock(짧게 play→pause)해 둬야 한다.
+  const getAlarmAudio = () => {
+    if (!alarmAudioRef.current) {
+      const a = new Audio(ALARM_DATA_URI);
+      a.preload = "auto";
+      alarmAudioRef.current = a;
+    }
+    return alarmAudioRef.current;
+  };
+  const unlockAudio = () => {
+    if (audioUnlockedRef.current) return;
+    audioUnlockedRef.current = true;
+    const a = getAlarmAudio();
+    a.muted = true;
+    const p = a.play();
+    if (p && typeof p.then === "function") {
+      p.then(() => { a.pause(); a.currentTime = 0; a.muted = false; })
+       .catch(() => { a.muted = false; audioUnlockedRef.current = false; });
+    } else {
+      a.pause(); a.currentTime = 0; a.muted = false;
+    }
+  };
+  const playAlarm = () => {
+    const a = getAlarmAudio();
+    try { a.currentTime = 0; } catch { /* noop */ }
+    const p = a.play();
+    if (p && typeof p.catch === "function") p.catch(() => { /* 정책 차단 등 무시 */ });
+  };
+
   // ─── 휴식 타이머 ───
   useEffect(() => {
     if (restTimer !== null && restTimer > 0) {
       timerRef.current = setInterval(() => {
         setRestTimer((prev) => {
-          if (prev <= 1) { clearInterval(timerRef.current); return 0; }
+          if (prev <= 1) {
+            clearInterval(timerRef.current);
+            // 완료 알람: WebAudio 비프 4연속 + HTMLAudio 백업 알람 + 진동
+            beep(880, 0.18, 0.6);
+            setTimeout(() => beep(880, 0.18, 0.6), 230);
+            setTimeout(() => beep(880, 0.18, 0.6), 460);
+            setTimeout(() => beep(1320, 0.6,  0.6), 760);
+            playAlarm();
+            vibrate([250, 120, 250, 120, 250, 120, 500]);
+            // 1.8초간 "완료!" 표시 후 자동 닫힘
+            setTimeout(() => setRestTimer(null), 1800);
+            return 0;
+          }
+          // 마지막 3초(3,2,1 표시) 카운트다운 비프 — 더 또렷하게
+          if (prev >= 2 && prev <= 4) beep(660, 0.12, 0.45);
           return prev - 1;
         });
       }, 1000);
@@ -256,6 +407,12 @@ export default function App() {
         ns[si] = { ...ns[si], done: !was };
         dl[i] = { ...dl[i], sets: ns };
         if (!was && ns[si].restSec > 0) {
+          getAudioCtx(); // 사용자 제스처 안에서 오디오 컨텍스트 깨우기
+          unlockAudio(); // HTMLAudio 백업 채널도 첫 제스처에서 unlock
+          // 시작음: 짧은 상승 비프 (도→솔)
+          beep(523, 0.09, 0.35);
+          setTimeout(() => beep(784, 0.12, 0.35), 100);
+          vibrate(80);
           setRestTimer(ns[si].restSec);
           setRestSeconds(ns[si].restSec);
         }
@@ -419,16 +576,16 @@ export default function App() {
 
               <div style={S.stepper}>
                 <button type="button" onClick={() => updateSet(exercise.id, si, "reps", Math.max(0, (set.reps||0) - 1))} style={S.stepSide}>−</button>
-                <input type="number" inputMode="numeric" value={set.reps}
-                  onChange={(e) => updateSet(exercise.id, si, "reps", Math.max(0, parseInt(e.target.value)||0))}
+                <NumberField value={set.reps}
+                  onChange={(n) => updateSet(exercise.id, si, "reps", n)}
                   style={S.stepInput}/>
                 <button type="button" onClick={() => updateSet(exercise.id, si, "reps", (set.reps||0) + 1)} style={S.stepSide}>+</button>
               </div>
 
               <div style={S.stepper}>
                 <button type="button" onClick={() => updateSet(exercise.id, si, "restSec", Math.max(0, (set.restSec||0) - 5))} style={S.stepSide}>−</button>
-                <input type="number" inputMode="numeric" value={set.restSec}
-                  onChange={(e) => updateSet(exercise.id, si, "restSec", Math.max(0, parseInt(e.target.value)||0))}
+                <NumberField value={set.restSec}
+                  onChange={(n) => updateSet(exercise.id, si, "restSec", n)}
                   style={S.stepInput}/>
                 <button type="button" onClick={() => updateSet(exercise.id, si, "restSec", (set.restSec||0) + 5)} style={S.stepSide}>+</button>
               </div>
@@ -599,7 +756,7 @@ export default function App() {
                   <div style={{ fontSize:12, color:T.textMuted, marginBottom:6, fontWeight:600 }}>기본 횟수</div>
                   <div style={{ display:"flex", alignItems:"center", gap:8 }}>
                     <button onClick={() => updateExerciseDefault(ex,"defaultReps",(ex.defaultReps||10)-1)} style={S.stepBtn}>−</button>
-                    <input type="number" value={ex.defaultReps||10} onChange={(e) => updateExerciseDefault(ex,"defaultReps",e.target.value)} style={{ ...S.settInput, flex:1 }}/>
+                    <NumberField value={ex.defaultReps||10} onChange={(n) => updateExerciseDefault(ex,"defaultReps",n)} style={{ ...S.settInput, flex:1 }}/>
                     <button onClick={() => updateExerciseDefault(ex,"defaultReps",(ex.defaultReps||10)+1)} style={S.stepBtn}>+</button>
                   </div>
                 </div>
@@ -607,7 +764,7 @@ export default function App() {
                   <div style={{ fontSize:12, color:T.textMuted, marginBottom:6, fontWeight:600 }}>휴식(초)</div>
                   <div style={{ display:"flex", alignItems:"center", gap:8 }}>
                     <button onClick={() => updateExerciseDefault(ex,"defaultRestSec",(ex.defaultRestSec||60)-5)} style={S.stepBtn}>−</button>
-                    <input type="number" value={ex.defaultRestSec||60} onChange={(e) => updateExerciseDefault(ex,"defaultRestSec",e.target.value)} style={{ ...S.settInput, flex:1 }}/>
+                    <NumberField value={ex.defaultRestSec||60} onChange={(n) => updateExerciseDefault(ex,"defaultRestSec",n)} style={{ ...S.settInput, flex:1 }}/>
                     <button onClick={() => updateExerciseDefault(ex,"defaultRestSec",(ex.defaultRestSec||60)+5)} style={S.stepBtn}>+</button>
                   </div>
                 </div>
@@ -624,7 +781,7 @@ export default function App() {
     if (!showPicker) return null;
     return (
       <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.65)", backdropFilter:"blur(3px)", zIndex:50, display:"flex", flexDirection:"column", justifyContent:"flex-end" }}>
-        <div style={{ background:T.surfaceSolid, borderRadius:"20px 20px 0 0", maxHeight:"80vh", overflow:"auto", padding:"20px 16px", borderTop:`1px solid ${T.border}` }}>
+        <div style={{ background:T.surfaceSolid, borderRadius:"20px 20px 0 0", maxHeight:"80vh", overflow:"auto", padding:"20px 16px", paddingBottom:"max(env(safe-area-inset-bottom), 32px)", borderTop:`1px solid ${T.border}` }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
             <h3 style={{ fontSize:18, fontWeight:800, color:T.text }}>운동 선택</h3>
             <button onClick={() => { setShowPicker(false); setShowAddCustom(false); }}
@@ -677,22 +834,34 @@ export default function App() {
 
   // ─── 휴식 타이머 오버레이 ───
   const RestOverlay = () => {
-    if (restTimer === null || restTimer <= 0) return null;
-    const pct = ((restSeconds - restTimer) / restSeconds) * 100;
+    if (restTimer === null) return null;
+    const done = restTimer <= 0;
+    const pct = done ? 100 : ((restSeconds - restTimer) / restSeconds) * 100;
     return (
-      <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background:"rgba(0,0,0,0.9)", zIndex:100, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"white" }}>
-        <Clock size={48} style={{ marginBottom:16, opacity:0.7 }}/>
-        <div style={{ fontSize:18, opacity:0.8, marginBottom:8 }}>휴식 시간</div>
-        <div style={{ fontSize:72, fontWeight:700, fontVariantNumeric:"tabular-nums" }}>
-          {Math.floor(restTimer/60)}:{String(restTimer%60).padStart(2,"0")}
+      <div style={{ position:"fixed", top:0, left:0, right:0, bottom:0, background: done ? "rgba(34,197,94,0.95)" : "rgba(0,0,0,0.9)", zIndex:100, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", color:"white", transition:"background 0.3s" }}>
+        {done
+          ? <Check size={72} style={{ marginBottom:8 }}/>
+          : <Clock size={48} style={{ marginBottom:16, opacity:0.7 }}/>}
+        <div style={{ fontSize:18, opacity:0.9, marginBottom:8 }}>
+          {done ? "휴식 끝! 다음 세트" : "휴식 시간"}
         </div>
-        <div style={{ width:200, height:6, background:"rgba(255,255,255,0.2)", borderRadius:3, marginTop:24, overflow:"hidden" }}>
-          <div style={{ width:`${pct}%`, height:"100%", background:"linear-gradient(90deg,#4ade80,#22c55e)", borderRadius:3, transition:"width 1s linear" }}/>
+        {!done && (
+          <div style={{ fontSize:72, fontWeight:700, fontVariantNumeric:"tabular-nums" }}>
+            {Math.floor(restTimer/60)}:{String(restTimer%60).padStart(2,"0")}
+          </div>
+        )}
+        {done && (
+          <div style={{ fontSize:42, fontWeight:700, letterSpacing:2 }}>GO!</div>
+        )}
+        <div style={{ width:200, height:6, background:"rgba(255,255,255,0.25)", borderRadius:3, marginTop:24, overflow:"hidden" }}>
+          <div style={{ width:`${pct}%`, height:"100%", background: done ? "white" : "linear-gradient(90deg,#4ade80,#22c55e)", borderRadius:3, transition:"width 1s linear" }}/>
         </div>
-        <button onClick={() => { setRestTimer(null); clearInterval(timerRef.current); }}
-          style={{ marginTop:32, padding:"12px 32px", borderRadius:12, background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.3)", color:"white", fontSize:16, cursor:"pointer" }}>
-          건너뛰기
-        </button>
+        {!done && (
+          <button onClick={() => { setRestTimer(null); clearInterval(timerRef.current); }}
+            style={{ marginTop:32, padding:"12px 32px", borderRadius:12, background:"rgba(255,255,255,0.15)", border:"1px solid rgba(255,255,255,0.3)", color:"white", fontSize:16, cursor:"pointer" }}>
+            건너뛰기
+          </button>
+        )}
       </div>
     );
   };
