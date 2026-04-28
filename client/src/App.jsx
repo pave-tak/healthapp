@@ -1,10 +1,11 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import {
   Plus, Trash2, ChevronLeft, ChevronRight, Dumbbell,
   Clock, Check, X, ListPlus, Calendar, TrendingUp,
   Home, History, Settings,
 } from "lucide-react";
 import { api } from "./api/index.js";
+import { exportToFile, parseBackup } from "./api/backup.js";
 
 // ─── 유틸 ───
 const formatDate = (date) => {
@@ -96,6 +97,26 @@ function NumberField({ value, onChange, min = 0, style }) {
   );
 }
 
+// ─── 카테고리 색상 팔레트 ───
+// 시드 카테고리는 고정색을 쓰고, 사용자가 새로 만든 카테고리는 이름 해시로
+// 안정적인 fallback 색을 부여한다. 같은 카테고리는 항상 같은 색.
+const CATEGORY_COLORS = {
+  "상체":   "#818cf8", // 인디고
+  "하체":   "#4ade80", // 그린
+  "유산소": "#fbbf24", // 앰버
+};
+const FALLBACK_PALETTE = [
+  "#f87171", "#c084fc", "#22d3ee", "#fb923c", "#a3e635",
+  "#f472b6", "#60a5fa", "#facc15", "#34d399", "#e879f9",
+];
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+const getCategoryColor = (cat) =>
+  CATEGORY_COLORS[cat] || FALLBACK_PALETTE[hashStr(cat || "기타") % FALLBACK_PALETTE.length];
+
 // ─── 다크 테마 팔레트 ───
 const T = {
   surface:      "rgba(30,41,59,0.7)",      // 카드 배경 (반투명)
@@ -147,6 +168,14 @@ export default function App() {
   const dateInputRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  // 통계 탭 상태(상위에 보관 — StatsTab 이 App 내부 함수라 매 렌더 재정의되어
+  // 컴포넌트 타입이 바뀌고 하위 상태가 리셋되므로 여기에 끌어올린다)
+  const [statsRange, setStatsRange]       = useState("all");      // "all" | "30d" | "7d"
+  const [statsGroupBy, setStatsGroupBy]   = useState("exercise"); // "exercise" | "category"
+  const [statsSort, setStatsSort]         = useState("doneSets");
+  const [stats, setStats]                 = useState(null);
+  const [statLoading, setStatLoading]     = useState(false);
+
   const openDatePicker = () => {
     const el = dateInputRef.current;
     if (!el) return;
@@ -158,18 +187,23 @@ export default function App() {
   const handleExport = async () => {
     try {
       const data = await api.exportAll();
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-      const url  = URL.createObjectURL(blob);
-      const ts = new Date().toISOString().replace(/[:-]/g, "").replace(/\..+/, "").replace("T", "-");
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `workout-backup-${ts}.json`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const wkN = Array.isArray(data?.workouts)      ? data.workouts.length      : 0;
+      const exN = Array.isArray(data?.exerciseTypes) ? data.exerciseTypes.length : 0;
+      const res = await exportToFile(data);
+      if (res.mode === "native-saved") {
+        alert(
+          `백업 저장 완료\n\n` +
+          `· 운동 종목 ${exN}개\n· 운동 기록 ${wkN}일\n\n` +
+          `파일: ${res.filename}\n위치: ${res.dirLabel || ""}\n경로: ${res.path}`
+        );
+      } else if (res.mode === "native-share") {
+        // 공유 시트로 사용자가 직접 저장처 선택 — 별도 알림 불필요
+      } else {
+        // web-download: 브라우저가 다운로드 폴더에 저장
+      }
     } catch (err) {
-      alert("백업 실패: " + err.message);
+      console.error("[backup] export error:", err);
+      alert("백업 실패: " + (err?.message || String(err)));
     }
   };
 
@@ -182,13 +216,17 @@ export default function App() {
     let data;
     try {
       const text = await file.text();
-      data = JSON.parse(text);
-    } catch {
-      alert("JSON 파일이 아닙니다.");
+      data = parseBackup(text);
+    } catch (err) {
+      alert(err?.message || "JSON 파일이 아닙니다.");
       return;
     }
     const exCount = Array.isArray(data?.exerciseTypes) ? data.exerciseTypes.length : 0;
     const wkCount = Array.isArray(data?.workouts)      ? data.workouts.length      : 0;
+    if (!Array.isArray(data?.exerciseTypes) || !Array.isArray(data?.workouts)) {
+      alert("백업 파일 구조가 올바르지 않습니다.\n(exerciseTypes / workouts 배열 필요)");
+      return;
+    }
     const ok = window.confirm(
       `현재 기기의 모든 데이터가 이 백업으로 덮어써집니다.\n\n` +
       `· 운동 종목: ${exCount}개\n· 운동 기록: ${wkCount}일\n\n계속하시겠습니까?`
@@ -199,7 +237,8 @@ export default function App() {
       alert("복원 완료! 페이지를 새로고침합니다.");
       location.reload();
     } catch (err) {
-      alert("복원 실패: " + err.message);
+      console.error("[backup] import error:", err);
+      alert("복원 실패: " + (err?.message || String(err)));
     }
   };
 
@@ -222,6 +261,19 @@ export default function App() {
       }
     })();
   }, []);
+
+  // ─── 통계 탭 진입/기간 변경/저장 후 통계 재집계 ───
+  // workoutLog 가 변하면(저장이 일어나면) 다음 통계 진입 시 최신값을 보여준다.
+  useEffect(() => {
+    if (loading) return;
+    if (tab !== "stats") return;
+    let alive = true;
+    setStatLoading(true);
+    api.getStats({ range: statsRange })
+      .then((d) => { if (alive) { setStats(d); setStatLoading(false); } })
+      .catch(() => { if (alive) setStatLoading(false); });
+    return () => { alive = false; };
+  }, [tab, statsRange, workoutLog, loading]);
 
   // ─── workoutLog 변경 시 자동 저장 (디바운스 500ms) ───
   const lastSavedRef = useRef({});
@@ -474,6 +526,35 @@ export default function App() {
     return t > 0 ? Math.round((d / t) * 100) : 0;
   };
 
+  // 종목명 → {icon, category} 매핑 (기록/통계 화면 표시용)
+  // ※ early-return 위에 둬야 첫 렌더(loading=true)와 이후 렌더의 hook 순서가 일치한다.
+  const exerciseMeta = useMemo(() => {
+    const map = new Map();
+    for (const [cat, list] of Object.entries(exercises)) {
+      for (const e of list) {
+        if (!map.has(e.name)) map.set(e.name, { icon: e.icon || "", category: cat });
+      }
+    }
+    return map;
+  }, [exercises]);
+  const iconOf = (name) => exerciseMeta.get(name)?.icon || "";
+
+  // 종목별 통계 정렬 (statsSort 변경 시 재계산)
+  const sortedByExercise = useMemo(() => {
+    if (!stats?.byExercise) return [];
+    const list = [...stats.byExercise];
+    const cmp = (a, b) => {
+      switch (statsSort) {
+        case "doneReps":       return b.doneReps - a.doneReps;
+        case "daysCount":      return b.daysCount - a.daysCount;
+        case "completionRate": return b.completionRate - a.completionRate;
+        case "doneSets":
+        default:               return b.doneSets - a.doneSets;
+      }
+    };
+    return list.sort((a, b) => cmp(a, b) || a.name.localeCompare(b.name));
+  }, [stats, statsSort]);
+
   // ─── 로딩 / 에러 화면 ───
   if (loading) {
     return (
@@ -626,22 +707,82 @@ export default function App() {
           </div>
         ) : dates.map((date) => {
           const log = workoutLog[date];
-          const ts = log.reduce((a,e) => a+e.sets.length, 0);
-          const ds = log.reduce((a,e) => a+e.sets.filter((s) => s.done).length, 0);
+          // 일별 합계: 완료/전체 세트, 완료 반복 합, 카테고리별 완료 세트 분포, 휴식 합
+          let totalSets = 0;
+          let doneSets = 0;
+          let doneReps = 0;
+          let restSecSum = 0;
+          const catDone = {}; // 카테고리 → 완료 세트 수
+          for (const ex of log) {
+            const cat = ex.category || exerciseMeta.get(ex.name)?.category || "기타";
+            for (const s of ex.sets || []) {
+              totalSets += 1;
+              restSecSum += Number(s.restSec) || 0;
+              if (s.done) {
+                doneSets += 1;
+                doneReps += Number(s.reps) || 0;
+                catDone[cat] = (catDone[cat] || 0) + 1;
+              }
+            }
+          }
+          const allDone = totalSets > 0 && doneSets === totalSets;
+          const restMin = Math.round(restSecSum / 60);
+          const catEntries = Object.entries(catDone).sort((a, b) => b[1] - a[1]);
+          const catTotal = catEntries.reduce((a, [, v]) => a + v, 0);
+
           return (
             <div key={date} onClick={() => { setSelectedDate(date); setTab("home"); }}
-              style={{ ...S.card, padding:16, marginBottom:10, cursor:"pointer" }}>
-              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
-                <div style={{ fontWeight:700, fontSize:16, color:T.text }}>{formatDateKor(date)}</div>
-                <div style={{ fontSize:13, fontWeight:600, color:ds===ts&&ts>0?"#4ade80":"#fbbf24" }}>{ds}/{ts} 세트</div>
+              style={{ ...S.card, padding:14, marginBottom:10, cursor:"pointer" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8, gap:8 }}>
+                <div style={{ fontWeight:700, fontSize:16, color:T.text, minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                  {formatDateKor(date)}
+                </div>
+                <div style={{ fontSize:13, fontWeight:700, color:allDone?"#4ade80":"#fbbf24", whiteSpace:"nowrap", fontVariantNumeric:"tabular-nums" }}>
+                  {doneSets}/{totalSets}세트 · {doneReps}회
+                </div>
               </div>
-              <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
-                {log.map((ex) => (
-                  <span key={ex.id} style={{ background:T.surfaceAlt, borderRadius:8, padding:"4px 10px", fontSize:13, color:T.textDim }}>
-                    {ex.name} ({ex.sets.length}세트)
-                  </span>
-                ))}
+
+              <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom: catTotal > 0 ? 10 : 0 }}>
+                {log.map((ex) => {
+                  const exDone  = ex.sets.filter((s) => s.done).length;
+                  const exTotal = ex.sets.length;
+                  const exReps  = ex.sets.filter((s) => s.done).reduce((a, s) => a + (Number(s.reps) || 0), 0);
+                  const ic = iconOf(ex.name);
+                  const allEx = exTotal > 0 && exDone === exTotal;
+                  return (
+                    <span key={ex.id} style={{
+                      background: allEx ? "rgba(34,197,94,0.18)" : T.surfaceAlt,
+                      border: allEx ? "1px solid rgba(34,197,94,0.45)" : `1px solid ${T.border}`,
+                      borderRadius:8, padding:"4px 10px", fontSize:12.5, color:T.textDim,
+                      whiteSpace:"nowrap", fontVariantNumeric:"tabular-nums",
+                    }}>
+                      {ic ? `${ic} ` : ""}{ex.name} <span style={{ color: allEx ? "#86efac" : T.textMuted }}>{exDone}/{exTotal}·{exReps}회</span>
+                    </span>
+                  );
+                })}
               </div>
+
+              {catTotal > 0 && (
+                <div style={{ display:"flex", alignItems:"center", gap:10, fontSize:11, color:T.textMuted }}>
+                  <div style={{ display:"flex", height:6, flex:1, borderRadius:3, overflow:"hidden", background:"rgba(15,23,42,0.6)" }}>
+                    {catEntries.map(([cat, v]) => (
+                      <div key={cat} title={`${cat} ${v}세트`} style={{
+                        width: `${(v / catTotal) * 100}%`,
+                        background: getCategoryColor(cat),
+                      }}/>
+                    ))}
+                  </div>
+                  <div style={{ display:"flex", gap:6, flexWrap:"wrap", justifyContent:"flex-end" }}>
+                    {catEntries.map(([cat, v]) => (
+                      <span key={cat} style={{ display:"inline-flex", alignItems:"center", gap:4 }}>
+                        <span style={{ width:8, height:8, borderRadius:2, background:getCategoryColor(cat) }}/>
+                        {cat} {v}
+                      </span>
+                    ))}
+                    {restMin > 0 && <span style={{ color:T.textDim }}>· 휴식 {restMin}분</span>}
+                  </div>
+                </div>
+              )}
             </div>
           );
         })}
@@ -651,70 +792,219 @@ export default function App() {
 
   // ─── 통계 탭 ───
   const StatsTab = () => {
-    const [stats, setStats] = useState(null);
-    const [statLoading, setStatLoading] = useState(true);
-
-    useEffect(() => {
-      api.getStats().then((d) => { setStats(d); setStatLoading(false); }).catch(() => setStatLoading(false));
-    }, []);
-
-    if (statLoading) return <div style={{ padding:40, textAlign:"center", color:T.textMuted }}>통계 불러오는 중...</div>;
-    if (!stats) return null;
-
-    const maxSets = Math.max(...stats.last7.map((d) => d.doneSets), 1);
     const today = formatDate(new Date());
+
+    const RangeBtn = ({ value, label }) => (
+      <button onClick={() => setStatsRange(value)}
+        style={{
+          flex:1, padding:"8px 0", borderRadius:10, border:"none",
+          background: statsRange === value ? "linear-gradient(135deg,#6366f1,#8b5cf6)" : T.surfaceAlt,
+          color: statsRange === value ? "white" : T.textDim,
+          fontSize:13, fontWeight:700, cursor:"pointer",
+        }}>{label}</button>
+    );
+    const GroupBtn = ({ value, label }) => (
+      <button onClick={() => setStatsGroupBy(value)}
+        style={{
+          flex:1, padding:"8px 0", borderRadius:10, border:"none",
+          background: statsGroupBy === value ? "#6366f1" : T.surfaceAlt,
+          color: statsGroupBy === value ? "white" : T.textDim,
+          fontSize:13, fontWeight:700, cursor:"pointer",
+        }}>{label}</button>
+    );
+
+    const last7Max = stats ? Math.max(...stats.last7.map((d) => d.doneSets), 1) : 1;
+    const catTotalDoneSets = stats
+      ? stats.byCategory.reduce((a, c) => a + c.doneSets, 0)
+      : 0;
 
     return (
       <div style={{ padding:"16px 16px 100px" }}>
-        <h2 style={{ fontSize:20, fontWeight:800, marginBottom:16, color:T.text }}>통계</h2>
-        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10, marginBottom:20 }}>
-          {[
-            { label:"운동 일수", value:stats.totalDays,  color:"#a5b4fc" },
-            { label:"총 세트",   value:stats.totalSets,  color:"#4ade80" },
-            { label:"총 횟수",   value:stats.totalReps,  color:"#fbbf24" },
-          ].map((s) => (
-            <div key={s.label} style={{ ...S.card, padding:16, textAlign:"center" }}>
-              <div style={{ fontSize:24, fontWeight:800, color:s.color }}>{s.value}</div>
-              <div style={{ fontSize:12, color:T.textMuted, marginTop:4 }}>{s.label}</div>
+        <h2 style={{ fontSize:20, fontWeight:800, marginBottom:12, color:T.text }}>통계</h2>
+
+        {/* 기간 토글 */}
+        <div style={{ display:"flex", gap:6, marginBottom:10 }}>
+          <RangeBtn value="all"  label="전체"/>
+          <RangeBtn value="30d"  label="30일"/>
+          <RangeBtn value="7d"   label="7일"/>
+        </div>
+        {/* 분류 토글 */}
+        <div style={{ display:"flex", gap:6, marginBottom:14 }}>
+          <GroupBtn value="exercise" label="종목별"/>
+          <GroupBtn value="category" label="카테고리별"/>
+        </div>
+
+        {statLoading && (
+          <div style={{ padding:24, textAlign:"center", color:T.textMuted, fontSize:13 }}>불러오는 중...</div>
+        )}
+
+        {!statLoading && stats && (
+          <>
+            {/* 요약 카드 4개 */}
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr 1fr", gap:8, marginBottom:18 }}>
+              {[
+                { label:"운동일",   value:stats.totalDays,       color:"#a5b4fc" },
+                { label:"완료세트", value:stats.totalSets,        color:"#4ade80" },
+                { label:"총 반복",  value:stats.totalReps,        color:"#fbbf24" },
+                { label:"완료율",   value:`${stats.completionRate}%`, color:"#f472b6" },
+              ].map((s) => (
+                <div key={s.label} style={{ ...S.card, padding:"12px 6px", textAlign:"center" }}>
+                  <div style={{ fontSize:18, fontWeight:800, color:s.color, fontVariantNumeric:"tabular-nums" }}>{s.value}</div>
+                  <div style={{ fontSize:11, color:T.textMuted, marginTop:2 }}>{s.label}</div>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
 
-        <div style={{ ...S.card, padding:16, marginBottom:20 }}>
-          <div style={{ fontSize:15, fontWeight:700, marginBottom:16, color:T.text }}>최근 7일</div>
-          <div style={{ display:"flex", alignItems:"flex-end", justifyContent:"space-between", height:120, gap:8 }}>
-            {stats.last7.map((d) => {
-              const dt = new Date(d.date + "T00:00:00");
-              const dayLabel = ["일","월","화","수","목","금","토"][dt.getDay()];
-              return (
-                <div key={d.date} style={{ flex:1, textAlign:"center" }}>
-                  <div style={{
-                    height: d.doneSets > 0 ? Math.max(20,(d.doneSets/maxSets)*90) : 4,
-                    background: d.doneSets > 0 ? "linear-gradient(180deg,#818cf8,#c084fc)" : T.surfaceAlt,
-                    borderRadius:6, marginBottom:6, transition:"height 0.3s ease",
-                    boxShadow: d.doneSets > 0 ? "0 2px 8px rgba(129,140,248,0.4)" : "none",
-                  }}/>
-                  <div style={{ fontSize:11, fontWeight:600, color:d.date===today?T.accent:T.textMuted }}>{dayLabel}</div>
-                  {d.doneSets > 0 && <div style={{ fontSize:10, color:T.textDim }}>{d.doneSets}</div>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-
-        {stats.topExercises.length > 0 && (
-          <div style={{ ...S.card, padding:16 }}>
-            <div style={{ fontSize:15, fontWeight:700, marginBottom:12, color:T.text }}>자주 하는 운동</div>
-            {stats.topExercises.map(([name, count], i) => (
-              <div key={name} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:i<stats.topExercises.length-1?`1px solid ${T.border}`:"none" }}>
-                <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-                  <div style={{ width:28, height:28, borderRadius:"50%", background:["#818cf8","#4ade80","#fbbf24","#f87171","#c084fc"][i], color:"white", fontSize:13, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center" }}>{i+1}</div>
-                  <span style={{ fontSize:15, fontWeight:600, color:T.text }}>{name}</span>
-                </div>
-                <span style={{ fontSize:14, color:T.textMuted }}>{count}회</span>
+            {/* 최근 7일 그래프 (range 무관 — 항상 7일 추이) */}
+            <div style={{ ...S.card, padding:16, marginBottom:18 }}>
+              <div style={{ fontSize:15, fontWeight:700, marginBottom:14, color:T.text }}>최근 7일</div>
+              <div style={{ display:"flex", alignItems:"flex-end", justifyContent:"space-between", height:120, gap:8 }}>
+                {stats.last7.map((d) => {
+                  const dt = new Date(d.date + "T00:00:00");
+                  const dayLabel = ["일","월","화","수","목","금","토"][dt.getDay()];
+                  return (
+                    <div key={d.date} style={{ flex:1, textAlign:"center" }}>
+                      <div style={{
+                        height: d.doneSets > 0 ? Math.max(20,(d.doneSets/last7Max)*90) : 4,
+                        background: d.doneSets > 0 ? "linear-gradient(180deg,#818cf8,#c084fc)" : T.surfaceAlt,
+                        borderRadius:6, marginBottom:6, transition:"height 0.3s ease",
+                        boxShadow: d.doneSets > 0 ? "0 2px 8px rgba(129,140,248,0.4)" : "none",
+                      }}/>
+                      <div style={{ fontSize:11, fontWeight:600, color:d.date===today?T.accent:T.textMuted }}>{dayLabel}</div>
+                      {d.doneSets > 0 && <div style={{ fontSize:10, color:T.textDim }}>{d.doneSets}</div>}
+                    </div>
+                  );
+                })}
               </div>
-            ))}
-          </div>
+            </div>
+
+            {/* 분류 토글 결과 */}
+            {statsGroupBy === "exercise" ? (
+              <div style={{ ...S.card, padding:14, marginBottom:18 }}>
+                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+                  <div style={{ fontSize:15, fontWeight:700, color:T.text }}>종목별</div>
+                  <select value={statsSort} onChange={(e) => setStatsSort(e.target.value)}
+                    style={{ background:T.inputBg, color:T.textDim, border:`1px solid ${T.borderStrong}`, borderRadius:8, padding:"4px 8px", fontSize:12 }}>
+                    <option value="doneSets">완료세트순</option>
+                    <option value="doneReps">반복수순</option>
+                    <option value="daysCount">일수순</option>
+                    <option value="completionRate">완료율순</option>
+                  </select>
+                </div>
+                {sortedByExercise.length === 0 ? (
+                  <div style={{ padding:"20px 0", textAlign:"center", fontSize:13, color:T.textMuted }}>
+                    이 기간에 기록이 없습니다
+                  </div>
+                ) : (
+                  <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                    {/* 헤더 */}
+                    <div style={{ display:"grid", gridTemplateColumns:"minmax(0,1fr) 36px 44px 52px 44px", gap:6, fontSize:11, color:T.textMuted, fontWeight:700, padding:"4px 8px" }}>
+                      <div>종목</div>
+                      <div style={{ textAlign:"right" }}>일수</div>
+                      <div style={{ textAlign:"right" }}>완료</div>
+                      <div style={{ textAlign:"right" }}>반복</div>
+                      <div style={{ textAlign:"right" }}>완료율</div>
+                    </div>
+                    {sortedByExercise.map((row) => {
+                      const ic = iconOf(row.name);
+                      return (
+                        <div key={row.name} style={{
+                          display:"grid",
+                          gridTemplateColumns:"minmax(0,1fr) 36px 44px 52px 44px",
+                          gap:6, alignItems:"center",
+                          padding:"8px 8px",
+                          background:"rgba(15,23,42,0.4)",
+                          borderRadius:10,
+                          borderLeft:`3px solid ${getCategoryColor(row.category)}`,
+                          fontSize:13, color:T.text, fontVariantNumeric:"tabular-nums",
+                        }}>
+                          <div style={{ minWidth:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                            <span style={{ fontWeight:600 }}>{ic ? `${ic} ` : ""}{row.name}</span>
+                            <span style={{ fontSize:11, color:T.textMuted, marginLeft:6 }}>{row.category}</span>
+                          </div>
+                          <div style={{ textAlign:"right" }}>{row.daysCount}</div>
+                          <div style={{ textAlign:"right", color:"#86efac" }}>{row.doneSets}/{row.totalSets}</div>
+                          <div style={{ textAlign:"right", color:"#fde68a" }}>{row.doneReps}</div>
+                          <div style={{ textAlign:"right", color: row.completionRate === 100 ? "#4ade80" : T.textDim }}>{row.completionRate}%</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ ...S.card, padding:14, marginBottom:18 }}>
+                <div style={{ fontSize:15, fontWeight:700, marginBottom:12, color:T.text }}>카테고리별</div>
+                {stats.byCategory.length === 0 ? (
+                  <div style={{ padding:"20px 0", textAlign:"center", fontSize:13, color:T.textMuted }}>
+                    이 기간에 기록이 없습니다
+                  </div>
+                ) : (
+                  <>
+                    {/* 가로 스택 막대 — 완료세트 비중 */}
+                    {catTotalDoneSets > 0 && (
+                      <>
+                        <div style={{ display:"flex", height:14, borderRadius:7, overflow:"hidden", background:"rgba(15,23,42,0.6)", marginBottom:10 }}>
+                          {stats.byCategory.filter((c) => c.doneSets > 0).map((c) => (
+                            <div key={c.category} title={`${c.category} ${c.doneSets}세트`} style={{
+                              width: `${(c.doneSets / catTotalDoneSets) * 100}%`,
+                              background: getCategoryColor(c.category),
+                            }}/>
+                          ))}
+                        </div>
+                        <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14, fontSize:12, color:T.textDim }}>
+                          {stats.byCategory.filter((c) => c.doneSets > 0).map((c) => (
+                            <span key={c.category} style={{ display:"inline-flex", alignItems:"center", gap:5 }}>
+                              <span style={{ width:10, height:10, borderRadius:2, background:getCategoryColor(c.category) }}/>
+                              {c.category} {Math.round((c.doneSets / catTotalDoneSets) * 100)}%
+                            </span>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                    {/* 카테고리 행 */}
+                    <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+                      {stats.byCategory.map((c) => (
+                        <div key={c.category} style={{
+                          display:"grid",
+                          gridTemplateColumns:"minmax(0,1fr) 64px 56px 44px",
+                          gap:6, alignItems:"center",
+                          padding:"10px 10px",
+                          background:"rgba(15,23,42,0.4)",
+                          borderRadius:10,
+                          borderLeft:`3px solid ${getCategoryColor(c.category)}`,
+                          fontSize:13, color:T.text, fontVariantNumeric:"tabular-nums",
+                        }}>
+                          <div style={{ fontWeight:700 }}>{c.category}</div>
+                          <div style={{ textAlign:"right", color:"#86efac" }}>{c.doneSets}/{c.totalSets} 세트</div>
+                          <div style={{ textAlign:"right", color:"#fde68a" }}>{c.doneReps}회</div>
+                          <div style={{ textAlign:"right", color: c.completionRate === 100 ? "#4ade80" : T.textDim }}>{c.completionRate}%</div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* 자주 하는 운동 (등장 일수 기준) — range 영향 받음 */}
+            {stats.topExercises.length > 0 && (
+              <div style={{ ...S.card, padding:16 }}>
+                <div style={{ fontSize:15, fontWeight:700, marginBottom:12, color:T.text }}>자주 하는 운동 (일수)</div>
+                {stats.topExercises.map(([name, count], i) => (
+                  <div key={name} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"10px 0", borderBottom:i<stats.topExercises.length-1?`1px solid ${T.border}`:"none" }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:10, minWidth:0 }}>
+                      <div style={{ width:28, height:28, borderRadius:"50%", background:["#818cf8","#4ade80","#fbbf24","#f87171","#c084fc"][i], color:"white", fontSize:13, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{i+1}</div>
+                      <span style={{ fontSize:15, fontWeight:600, color:T.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                        {iconOf(name) ? `${iconOf(name)} ` : ""}{name}
+                      </span>
+                    </div>
+                    <span style={{ fontSize:14, color:T.textMuted, flexShrink:0 }}>{count}일</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
         )}
       </div>
     );

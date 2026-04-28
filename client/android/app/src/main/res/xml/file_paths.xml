@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Capacitor Share 가 백업 JSON 을 외부 앱(메일/드라이브/저장소)로 넘길 때
+  FileProvider 가 file:// URI 를 content:// URI 로 변환한다. 아래 경로 중
+  하나라도 등록 안 되어 있으면 IllegalArgumentException 으로 공유가 실패한다.
+  Capacitor Filesystem Directory.Documents/External/Cache 모두를 커버한다.
+-->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="my_images" path="." />
-    <cache-path name="my_cache_images" path="." />
+    <external-path        name="external"        path="." />
+    <cache-path           name="cache"           path="." />
+    <external-files-path  name="external-files"  path="." />
+    <external-cache-path  name="external-cache"  path="." />
+    <files-path           name="files"           path="." />
 </paths>

@@ -124,37 +124,106 @@ async function deleteWorkout(date) {
 }
 
 // ─── 통계 ───
-async function getStats() {
+// range: "all" | "30d" | "7d"  — 합계와 분류 집계는 이 기간을 기준으로 산정.
+// last7 은 항상 오늘 포함 최근 7일 (UI 7일 그래프 전용).
+async function getStats(opts = {}) {
   await ready();
+  const range = opts.range || "all";
   const all = await db.workouts.toArray();
 
-  // totalDays: exercises가 있는 날 수
-  const days = all.filter((r) => r.exercises?.length > 0);
+  let cutoffStr = null;
+  if (range === "7d" || range === "30d") {
+    const days = range === "7d" ? 7 : 30;
+    const cutoff = new Date();
+    cutoff.setHours(0, 0, 0, 0);
+    cutoff.setDate(cutoff.getDate() - (days - 1));
+    cutoffStr = toDateStr(cutoff);
+  }
+  const filtered = cutoffStr
+    ? all.filter((r) => r.date >= cutoffStr)
+    : all;
+
+  const days = filtered.filter((r) => r.exercises?.length > 0);
   const totalDays = days.length;
 
-  // totalSets / totalReps: done=true 세트 기준
-  let totalSets = 0;
-  let totalReps = 0;
-  const exerciseCount = new Map(); // 종목명 → 등장 일수 (기존 서버 topExercises 로직과 동일)
+  let totalSets = 0;       // 완료 세트
+  let totalSetsAll = 0;    // 완료 + 미완료
+  let totalReps = 0;       // 완료 세트 기준 반복 합
+  const exerciseCount = new Map();
+  const byExerciseMap = new Map();
+  const byCategoryMap = new Map();
 
   for (const day of days) {
+    const seenInDay = new Set();
     for (const ex of day.exercises) {
-      exerciseCount.set(ex.name, (exerciseCount.get(ex.name) || 0) + 1);
+      const name = ex.name || "(이름없음)";
+      const cat  = ex.category || "기타";
+      if (!seenInDay.has(name)) {
+        seenInDay.add(name);
+        exerciseCount.set(name, (exerciseCount.get(name) || 0) + 1);
+      }
+      if (!byExerciseMap.has(name)) {
+        byExerciseMap.set(name, {
+          name, category: cat,
+          days: new Set(), doneSets: 0, totalSets: 0, doneReps: 0,
+        });
+      }
+      const eAgg = byExerciseMap.get(name);
+      eAgg.days.add(day.date);
+
+      if (!byCategoryMap.has(cat)) {
+        byCategoryMap.set(cat, { category: cat, doneSets: 0, totalSets: 0, doneReps: 0 });
+      }
+      const cAgg = byCategoryMap.get(cat);
+
       for (const s of ex.sets || []) {
+        eAgg.totalSets  += 1;
+        cAgg.totalSets  += 1;
+        totalSetsAll    += 1;
         if (s.done) {
+          const reps = Number(s.reps) || 0;
+          eAgg.doneSets += 1;
+          eAgg.doneReps += reps;
+          cAgg.doneSets += 1;
+          cAgg.doneReps += reps;
           totalSets += 1;
-          totalReps += Number(s.reps) || 0;
+          totalReps += reps;
         }
       }
     }
   }
 
-  // topExercises: [[name, count], …] 상위 5
+  const byExercise = [...byExerciseMap.values()].map((e) => ({
+    name:           e.name,
+    category:       e.category,
+    daysCount:      e.days.size,
+    doneSets:       e.doneSets,
+    totalSets:      e.totalSets,
+    doneReps:       e.doneReps,
+    completionRate: e.totalSets > 0 ? Math.round((e.doneSets / e.totalSets) * 100) : 0,
+  })).sort((a, b) =>
+    b.doneSets - a.doneSets ||
+    b.doneReps - a.doneReps ||
+    a.name.localeCompare(b.name)
+  );
+
+  const byCategory = [...byCategoryMap.values()].map((c) => ({
+    category:       c.category,
+    doneSets:       c.doneSets,
+    totalSets:      c.totalSets,
+    doneReps:       c.doneReps,
+    completionRate: c.totalSets > 0 ? Math.round((c.doneSets / c.totalSets) * 100) : 0,
+  })).sort((a, b) => b.doneSets - a.doneSets);
+
+  const completionRate = totalSetsAll > 0
+    ? Math.round((totalSets / totalSetsAll) * 100)
+    : 0;
+
   const topExercises = [...exerciseCount.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 5);
 
-  // last7: 오늘 포함 최근 7일별 완료 세트 수
+  // last7 은 range 와 무관하게 항상 오늘 포함 7일 (그래프 일관성)
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const last7 = [];
@@ -173,7 +242,18 @@ async function getStats() {
     last7.push({ date: key, doneSets });
   }
 
-  return { totalDays, totalSets, totalReps, topExercises, last7 };
+  return {
+    range,
+    totalDays,
+    totalSets,
+    totalSetsAll,
+    totalReps,
+    completionRate,
+    byExercise,
+    byCategory,
+    topExercises,
+    last7,
+  };
 }
 
 // ─── 백업 / 복원 ───
